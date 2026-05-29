@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Standalone build output
+*.exe
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE
+.idea/
