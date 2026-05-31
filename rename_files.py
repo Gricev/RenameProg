@@ -1,4 +1,5 @@
 
+import math
 import os
 import sys
 
@@ -11,18 +12,32 @@ except ImportError:
 ARGS_FILE = "rename_args.txt"
 PDF_EXT = ".pdf"
 
-# Шрифт для вставляемого текста. Arial есть на любой Windows и поддерживает кириллицу.
+# Шрифт для вставляемого текста. GOST_A поддерживает кириллицу и соответствует ЕСКД.
 PDF_FONT_NAME = "replfont"
-PDF_FONT_FILE = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf")
+PDF_FONT_FILE = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "GOST_A.TTF")
+# Матрицы сдвига для наклона 75° по ГОСТ 2.304 (tan(15°) ≈ 0.268).
+# _GOST_SHEAR — для 0° и ±90°; _GOST_SHEAR_INV — для 180° (зеркальный наклон).
+_GOST_SHEAR     = fitz.Matrix(1, 0,  math.tan(math.radians(15)), 1, 0, 0)
+_GOST_SHEAR_INV = fitz.Matrix(1, 0, -math.tan(math.radians(15)), 1, 0, 0)
+# Отступ базовой линии от края rect в долях fontsize. Увеличьте, чтобы поднять текст.
+_BASELINE_OFFSET = 0.25
+# Сдвиг точки вставки в долях fontsize (+ вправо, - влево).
+_TEXT_X_OFFSET = 0.0
 
 
-def parse_args_file(path: str) -> list[tuple[str, str]]:
+def parse_args_file(path: str) -> tuple[list[tuple[str, str]], bool]:
     pairs = []
+    apply_pdf = True
     with open(path, encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+            if "=" in line and " to " not in line:
+                key, _, val = line.partition("=")
+                if key.strip().lower() == "apply_pdf_replacement":
+                    apply_pdf = val.strip().lower() not in ("false", "0", "no", "нет")
+                    continue
             parts = line.split(" to ", maxsplit=1)
             if len(parts) != 2:
                 print(f"  Строка {lineno} пропущена (неверный формат): {line!r}")
@@ -32,7 +47,7 @@ def parse_args_file(path: str) -> list[tuple[str, str]]:
                 print(f"  Строка {lineno} пропущена: пустая строка замены.")
                 continue
             pairs.append((old, new))
-    return pairs
+    return pairs, apply_pdf
 
 
 def rename_in_name(name: str, pairs: list[tuple[str, str]]) -> str:
@@ -57,8 +72,12 @@ def find_pdf_pairs_in_content(pdf_path: str, pairs: list[tuple[str, str]]) -> li
     return matching
 
 
-def _detect_fontsize(text_dict: dict, rect) -> float | None:
-    best = None
+def _detect_span_props(text_dict: dict, rect) -> tuple[float | None, tuple[float, float], fitz.Point | None]:
+    """Возвращает (fontsize, dir, origin) ближайшего к rect спана.
+    origin — точная базовая линия символа: используется для выравнивания вставки."""
+    best_size = None
+    best_dir = (1.0, 0.0)
+    best_origin = None
     for block in text_dict.get("blocks", []):
         if block.get("type") != 0:
             continue
@@ -67,9 +86,19 @@ def _detect_fontsize(text_dict: dict, rect) -> float | None:
                 sr = fitz.Rect(span["bbox"])
                 if sr.intersects(rect):
                     size = span.get("size")
-                    if size and (best is None or abs(sr.y1 - sr.y0 - (rect.y1 - rect.y0)) < 0.5):
-                        best = size
-    return best
+                    if size and (best_size is None or abs(sr.y1 - sr.y0 - (rect.y1 - rect.y0)) < 0.5):
+                        best_size = size
+                        transform = span.get("transform")
+                        if transform:
+                            dx, dy = transform[0], transform[1]
+                            norm = math.hypot(dx, dy)
+                            best_dir = (dx / norm, dy / norm) if norm > 0 else (1.0, 0.0)
+                        else:
+                            best_dir = span.get("dir", (1.0, 0.0))
+                        o = span.get("origin")
+                        if o:
+                            best_origin = fitz.Point(o)
+    return best_size, best_dir, best_origin
 
 
 def apply_pdf_replacements(pdf_path: str, pairs: list[tuple[str, str]]) -> int:
@@ -78,30 +107,65 @@ def apply_pdf_replacements(pdf_path: str, pairs: list[tuple[str, str]]) -> int:
     tmp = pdf_path + ".tmp"
     try:
         for page in doc:
-            text_dict = page.get_text("dict")
+            text_dict = page.get_text("rawdict")
             occurrences = []
             for old, new in pairs:
+                all_quads = page.search_for(old, quads=True)
                 for rect in page.search_for(old):
-                    fontsize = _detect_fontsize(text_dict, rect) or 10.0
-                    occurrences.append((new, rect, fontsize))
+                    # Ищем первый квад, пересекающийся с rect, для определения направления.
+                    # search_for(quads=True) возвращает по одному квadu на символ,
+                    # поэтому нельзя просто zip — используем пересечение.
+                    dir_vec = (1.0, 0.0)
+                    for quad in all_quads:
+                        if rect.intersects(quad.rect):
+                            dx = quad.ur.x - quad.ul.x
+                            dy = quad.ur.y - quad.ul.y
+                            norm = math.hypot(dx, dy)
+                            if norm > 0:
+                                dir_vec = (dx / norm, dy / norm)
+                            break
+                    fontsize, _, origin = _detect_span_props(text_dict, rect)
+                    fontsize = fontsize or 10.0
+                    occurrences.append((new, rect, fontsize, dir_vec, origin))
 
             if not occurrences:
                 continue
 
-            # Шаг 1: стираем все старые вхождения (без вставки текста).
-            for _, rect, _ in occurrences:
-                page.add_redact_annot(rect, fill=(1, 1, 1))
+            # Шаг 1: стираем старые вхождения с отступом, чтобы не перекрывать линии ячейки.
+            for _, rect, fontsize, _, _ in occurrences:
+                pad = fontsize * 0.2
+                erase_rect = fitz.Rect(rect.x0 + pad, rect.y0 + pad, rect.x1 - pad, rect.y1 - pad)
+                page.add_redact_annot(erase_rect, fill=(1, 1, 1))
             page.apply_redactions(images=0, graphics=0)
 
-            # Шаг 2: вставляем новый текст в тех же позициях своим шрифтом.
-            for new, rect, fontsize in occurrences:
-                baseline = fitz.Point(rect.x0, rect.y1 - fontsize * 0.15)
+            # Шаг 2: вставляем новый текст с наклоном 75° (ГОСТ) и учётом поворота.
+            for new, rect, fontsize, dir_vec, origin in occurrences:
+                dx, dy = dir_vec
+                angle = math.degrees(math.atan2(dy, dx))
+                # Базовая линия берётся из span["origin"] для точного выравнивания с оригиналом.
+                if abs(angle) < 1:
+                    y = origin[1] if origin else rect.y1 - fontsize * _BASELINE_OFFSET
+                    baseline = fitz.Point(rect.x0, y)
+                elif abs(angle + 90) < 1:
+                    x = origin[0] if origin else rect.x1 - fontsize * _BASELINE_OFFSET
+                    baseline = fitz.Point(x, rect.y1)
+                elif abs(angle - 90) < 1:
+                    x = origin[0] if origin else rect.x0 + fontsize * _BASELINE_OFFSET
+                    baseline = fitz.Point(x, rect.y0)
+                elif abs(abs(angle) - 180) < 1:
+                    y = origin[1] if origin else rect.y0 + fontsize * _BASELINE_OFFSET
+                    baseline = fitz.Point(rect.x1, y)
+                else:
+                    y = origin[1] if origin else rect.y1 - fontsize * _BASELINE_OFFSET
+                    baseline = fitz.Point(rect.x0, y)
+                mat = _GOST_SHEAR * fitz.Matrix(angle)
                 page.insert_text(
                     baseline,
                     new,
                     fontname=PDF_FONT_NAME,
                     fontfile=PDF_FONT_FILE,
                     fontsize=fontsize,
+                    morph=(baseline, mat),
                 )
             total += len(occurrences)
         doc.save(tmp, garbage=4, deflate=True)
@@ -111,7 +175,7 @@ def apply_pdf_replacements(pdf_path: str, pairs: list[tuple[str, str]]) -> int:
     return total
 
 
-def build_plan(directory: str, pairs: list[tuple[str, str]]) -> list[tuple[str, str, list[tuple[str, str]], bool]]:
+def build_plan(directory: str, pairs: list[tuple[str, str]], apply_pdf: bool = True) -> list[tuple[str, str, list[tuple[str, str]], bool]]:
     script_name = os.path.basename(__file__) if not getattr(sys, "frozen", False) else os.path.basename(sys.executable)
     plan = []
     for name in sorted(os.listdir(directory)):
@@ -123,7 +187,7 @@ def build_plan(directory: str, pairs: list[tuple[str, str]]) -> list[tuple[str, 
         is_pdf = name.lower().endswith(PDF_EXT)
         new_name = rename_in_name(name, pairs)
         pdf_pairs: list[tuple[str, str]] = []
-        if is_pdf:
+        if is_pdf and apply_pdf:
             try:
                 pdf_pairs = find_pdf_pairs_in_content(path, pairs)
             except Exception as e:
@@ -173,12 +237,15 @@ def main() -> None:
         print(f"Создайте его в той же папке, формат строки:  В671 to В345")
         sys.exit(1)
 
-    pairs = parse_args_file(args_path)
+    pairs, apply_pdf = parse_args_file(args_path)
     if not pairs:
         print("Нет корректных строк для обработки.")
         sys.exit(1)
 
-    plan = build_plan(directory, pairs)
+    if not apply_pdf:
+        print("Режим: только переименование файлов (замена в штампах PDF отключена).")
+
+    plan = build_plan(directory, pairs, apply_pdf)
     print()
     if not plan:
         print("Совпадений ни в именах файлов, ни в штампах PDF не найдено.")
